@@ -10,30 +10,73 @@ import org.bson.BSONObject
 import org.apache.spark.sql._
 import scala.collection.convert.wrapAsScala._
 import org.slf4j.{Logger, LoggerFactory}
+import org.python.util.PythonInterpreter
+import org.python.core.{PyObject, PyString}
+import org.json4s.jackson.Serialization
+
+/*
+spark-submit --class com.goibibo.dp.mShift.main --packages "org.apache.hadoop:hadoop-aws:2.7.2,com.amazonaws:aws-java-sdk:1.7.4,org.mongodb.mongo-hadoop:mongo-hadoop-core:2.0.1,com.databricks:spark-redshift_2.10:1.1.0,org.python:jython-standalone:2.7.0" --files "/tmp/udf.py" --num-executors 2 --jars "/tmp/RedshiftJDBC4-1.1.17.1017.jar" mongodb_redshift_export_2.10-0.1.jar gnsdevice.json
+*/
+
+object PythonToJavaConverter {
+
+    private val logger: Logger = LoggerFactory.getLogger(this.getClass)
+    
+    def createUdfMap(sc:SparkContext, udfNames: Array[String]): scala.collection.immutable.Map[String, org.python.core.PyObject] = {
+        logger.info("Udf list - {}", udfNames)
+        val filesArgs = sc.getConf.getAll.toMap.get("spark.yarn.dist.files")
+        filesArgs match {
+            case Some(fileName) => {
+                logger.info("Files in args - {}", fileName)
+                val udfFile = fileName.split("/").last
+                logger.info("Loading Udf from py file - {}", udfFile)
+                val udfData: String = SchemaReader.readFile(udfFile)
+                val interpreter = new PythonInterpreter()
+                interpreter.exec(udfData)
+                val udfMap = udfNames.map(udfName =>(udfName, interpreter.get(udfName))).toMap
+                logger.info("udfMap - {}", udfMap)
+                udfMap
+            }
+            case None => scala.collection.immutable.Map[String, org.python.core.PyObject]() 
+        }
+    }   
+}
 
 object MongoDataImporter {
-    private val logger: Logger = LoggerFactory.getLogger(this.getClass)
 
-    def getFieldfromDoc(doc:Map[Object,Object], fieldName:String): Any = {
-        if (doc.containsKey(fieldName)) return doc.get(fieldName)
-        val index = fieldName.indexOf('.')
-        if (index != -1) {
-            val nestedColumns = fieldName.splitAt(index) 
-            val nestedObj = doc.get(nestedColumns._1)
-            if(Option(nestedObj:Object).isDefined){ 
-                return getFieldfromDoc( nestedObj.asInstanceOf[Map[Object,Object]], nestedColumns._2.tail)
-            } else {
-                logger.info("Couldn't find object for {}",fieldName)
-                logger.debug("Object data is {}",doc)
+    private val logger: Logger = LoggerFactory.getLogger(this.getClass)
+    implicit val formats = org.json4s.DefaultFormats
+
+    def getFieldfromDoc(doc:Map[Object,Object], fieldName:String, udf: Option[String])(implicit jsonConfigData: DataMapping, udfMap: scala.collection.immutable.Map[String, org.python.core.PyObject] ): Any = {
+        udf match {
+            case Some(udfFunction) => {
+                val udfObj = udfMap.get(udfFunction).get
+                val resultPy = udfObj.__call__(new PyString(Serialization.write(doc)))
+                resultPy.__tojava__(classOf[String]).asInstanceOf[String] 
+                }
+            case None => {
+                if (doc.containsKey(fieldName)) return doc.get(fieldName)
+                val index = fieldName.indexOf('.')
+                val fieldValue = if (index != -1) {
+                    val nestedColumns = fieldName.splitAt(index) 
+                    val nestedObj = doc.get(nestedColumns._1)
+                    if(Option(nestedObj:Object).isDefined){ 
+                        return getFieldfromDoc( nestedObj.asInstanceOf[Map[Object,Object]], nestedColumns._2.tail, udf)
+                    } else {
+                        logger.info("Couldn't find object for {}", fieldName)
+                        logger.debug("Object data is {}", doc)
+                    }
+                } else {
+                    logger.warn("Wrong field name {}",fieldName)
+                    null
+                }
+                fieldValue
             }
-        } else {
-            logger.warn("Wrong field name {}",fieldName)
         }
-        return null
     }
 
-    def parser(doc: Map[Object,Object], columnNames:Seq[String]) : Row = {
-        Row.fromSeq( columnNames.map(getFieldfromDoc(doc, _))  )
+    def parser(doc: Map[Object,Object])(implicit jsonConfigData: DataMapping, udfMap: scala.collection.immutable.Map[String, org.python.core.PyObject]) : Row = {
+        Row.fromSeq( jsonConfigData.columns.map(column => getFieldfromDoc(doc, column.columnName, column.udf))  )
     }
 
     def getMongoConfig(dataMapping:DataMapping): Configuration = {
@@ -46,7 +89,6 @@ object MongoDataImporter {
 
         logger.info("mongo.input.splits.min_docs = {}", Settings.documentsPerSplit)
         mongoConfig.setInt("mongo.input.splits.min_docs", Settings.documentsPerSplit)
-
 
         mongoConfig.setClass("mongo.splitter.class", classOf[MongoPaginatingSplitter], classOf[MongoSplitter])
         mongoConfig.setBoolean("mongo.input.notimeout", true)
@@ -63,11 +105,20 @@ object MongoDataImporter {
                     )
     }
 
+    def getUdfList(implicit dataMapping:DataMapping): Array[String] = dataMapping.columns.filter(_.udf.isDefined).map(_.udf.get)
+
     def loadData(sc:SparkContext, dataMapping:DataMapping):RDD[Row]={
-        val columnSourceNames = SchemaReader.getColumnSourceList(dataMapping)
+
+        implicit val columnSourceNames: Seq[String] = SchemaReader.getColumnSourceList(dataMapping)
+        implicit val jsonConfigData: DataMapping = dataMapping
+
+        logger.info("getUdfList  = {}", getUdfList)
+ 
+        @transient implicit val udfMap = PythonToJavaConverter.createUdfMap(sc, getUdfList)
+ 
         logger.info("columnSourceNames = {}", columnSourceNames)
         getMongoRdd(sc,dataMapping).map(_._2.asInstanceOf[Map[Object,Object]])
-                    .map(d => parser(d, columnSourceNames))
+                    .map(d => parser(d))
 
     }
 

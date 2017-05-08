@@ -13,7 +13,8 @@ libraryDependencies ++= Seq(
   "com.databricks"          %%  "spark-redshift"  % "1.1.0" ,
   "org.mongodb.mongo-hadoop" %  "mongo-hadoop-core" % "1.5.2",
   "com.amazonaws"           %   "aws-java-sdk"    % "1.7.4",
-  "org.apache.hadoop"       %   "hadoop-aws"      % "2.7.2"
+  "org.apache.hadoop"       %   "hadoop-aws"      % "2.7.2",
+  "org.python" % "jython-standalone" % "2.7.0"
 )
 
 mergeStrategy in assembly := {
