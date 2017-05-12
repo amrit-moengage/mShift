@@ -24,9 +24,17 @@ object PythonToJavaConverter {
     
     def createUdfMap(sc:SparkContext, udfNames: Array[String]): scala.collection.immutable.Map[String, org.python.core.PyObject] = {
         logger.info("Udf list - {}", udfNames)
+
         val filesArgs = sc.getConf.getAll.toMap.get("spark.yarn.dist.files")
+
         filesArgs match {
             case Some(fileName) => {
+                val pyFiles = fileName.split(",").filter(_.contains(".py"))
+                if (pyFiles.length == 0) {
+                    logger.warn("No python udf file found")
+                    return scala.collection.immutable.Map[String, org.python.core.PyObject]()
+                }
+
                 logger.info("Files in args - {}", fileName)
                 val udfFile = fileName.split("/").last
                 logger.info("Loading Udf from py file - {}", udfFile)
@@ -75,6 +83,14 @@ object MongoDataImporter {
         }
     }
 
+    def mapParser(sc: SparkContext, docs: Iterator[Map[Object,Object]])(implicit jsonConfigData: DataMapping) : Iterator[Row] = {
+
+        implicit val udfMap = PythonToJavaConverter.createUdfMap(sc, getUdfList)
+        val parsedDocs = docs.map( doc => Row.fromSeq( jsonConfigData.columns.map(column => getFieldfromDoc(doc, column.columnName, column.udf)))).toSeq
+        parsedDocs.iterator
+
+    }
+
     def parser(doc: Map[Object,Object])(implicit jsonConfigData: DataMapping, udfMap: scala.collection.immutable.Map[String, org.python.core.PyObject]) : Row = {
         Row.fromSeq( jsonConfigData.columns.map(column => getFieldfromDoc(doc, column.columnName, column.udf))  )
     }
@@ -107,19 +123,22 @@ object MongoDataImporter {
 
     def getUdfList(implicit dataMapping:DataMapping): Array[String] = dataMapping.columns.filter(_.udf.isDefined).map(_.udf.get)
 
-    def loadData(sc:SparkContext, dataMapping:DataMapping):RDD[Row]={
+    def loadData(sc:SparkContext, dataMapping:DataMapping): RDD[Row] = {
 
         implicit val columnSourceNames: Seq[String] = SchemaReader.getColumnSourceList(dataMapping)
         implicit val jsonConfigData: DataMapping = dataMapping
+        implicit val tmpUdfMap = scala.collection.immutable.Map[String, org.python.core.PyObject]()
 
         logger.info("getUdfList  = {}", getUdfList)
- 
-        @transient implicit val udfMap = PythonToJavaConverter.createUdfMap(sc, getUdfList)
- 
         logger.info("columnSourceNames = {}", columnSourceNames)
-        getMongoRdd(sc,dataMapping).map(_._2.asInstanceOf[Map[Object,Object]])
+
+        dataMapping.pyUdf match {
+            case Some(pyUdfFile) => {
+                logger.info("pyUdf File found = {}",pyUdfFile)        
+                getMongoRdd(sc,dataMapping).map(_._2.asInstanceOf[Map[Object,Object]]).mapPartitions( mapParser(sc, _) )
+                }
+            case None => getMongoRdd(sc,dataMapping).map(_._2.asInstanceOf[Map[Object,Object]])
                     .map(d => parser(d))
-
+        }
     }
-
 }
