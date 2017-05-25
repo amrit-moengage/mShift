@@ -25,7 +25,7 @@ package object mShift {
     	extraCopyOptions:String, 
         preActions:String, 
         postActions:String,
-        redshiftWriteMode:String)
+        redshiftWriteMode:Option[String])
 }
 
 
